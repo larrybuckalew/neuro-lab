@@ -1,0 +1,963 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<meta name="theme-color" content="#070b16">
+<title>NEURO — watch a population learn</title>
+<style>
+  * { box-sizing: border-box; }
+  html, body {
+    margin: 0; height: 100%; overflow: hidden;
+    background: radial-gradient(120% 120% at 50% 0%, #0f1830 0%, #060912 55%, #04060c 100%);
+    font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+    -webkit-user-select: none; user-select: none;
+    touch-action: none;
+    display: flex; align-items: center; justify-content: center;
+  }
+  #shell {
+    position: relative;
+    width: min(100vw, calc(100vh * 1.6));
+    aspect-ratio: 1200 / 750;
+    border-radius: 14px;
+    overflow: hidden;
+    box-shadow: 0 30px 90px rgba(0,0,0,.75), 0 0 0 1px rgba(120,170,255,.16), 0 0 0 8px rgba(8,12,22,.9);
+  }
+  canvas { display: block; width: 100%; height: 100%; }
+
+  #ui {
+    position: absolute; inset: 0; pointer-events: none;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 18px;
+  }
+  #bar {
+    display: flex; gap: 8px; align-items: center; flex-wrap: wrap;
+    pointer-events: auto; align-self: flex-end;
+  }
+  button {
+    font: inherit; font-size: 13px; font-weight: 700;
+    color: #cdd8f5; background: rgba(16, 24, 42, .72);
+    border: 1px solid rgba(120, 150, 220, .28);
+    border-radius: 10px; padding: 9px 13px; cursor: pointer;
+    backdrop-filter: blur(6px);
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  button:hover { border-color: rgba(196, 242, 74, .6); color: #eaf3d0; }
+  button.on { background: rgba(196, 242, 74, .16); border-color: rgba(196, 242, 74, .85); color: #e9ffb0; }
+  button:active { transform: translateY(1px); }
+  #hint {
+    position: absolute; left: 18px; bottom: 18px;
+    font-size: 11px; line-height: 1.7; color: rgba(160, 180, 220, .55);
+    pointer-events: none;
+  }
+  #hint b { color: rgba(196, 242, 74, .8); font-weight: 700; }
+  @media (max-width: 640px) { #hint { display: none; } button { padding: 7px 10px; font-size: 12px; } }
+</style>
+</head>
+<body>
+<div id="shell">
+  <canvas id="c" width="1200" height="750"></canvas>
+  <div id="ui">
+    <div id="bar">
+      <button id="bPause" title="Space">Pause</button>
+      <button id="b1" title="1">1&times;</button>
+      <button id="b4" class="on" title="2">4&times;</button>
+      <button id="b16" title="3">16&times;</button>
+      <button id="bNew" title="R">New run</button>
+    </div>
+  </div>
+  <div id="hint">
+    <b>space</b> pause &nbsp; <b>1 2 3</b> speed &nbsp; <b>N</b> skip generation &nbsp; <b>R</b> new run
+  </div>
+</div>
+<script>
+(() => {
+'use strict';
+
+/* ============================================================================
+   NEURO — a neuroevolution lab.
+
+   A population of simple agents, each driven by a tiny feed-forward network,
+   learns to run and jump a fixed obstacle course. Nothing is scripted: the only
+   thing crossing the finish line is selection pressure.
+
+   The simulation (Sim / Agent / Brain / course) is pure logic with no DOM, so
+   tools/converge.mjs can run it headlessly and prove it actually learns.
+   ========================================================================== */
+
+// ------------------------------------------------------------------ constants
+const W = 1200;
+const H = 750;
+const GROUND_Y = 600;
+const TILE = 32;
+
+const GRAVITY = 2000;
+const JUMP_V = 700;
+const MAX_SPEED = 205;
+const ACCEL = 1700;
+const AGENT_SIZE = 26;
+const AGENT_R = AGENT_SIZE / 2;
+
+const TIME_LIMIT = 10;      // seconds a generation may run
+const STUCK_TIME = 1.5;     // no forward progress this long -> agent is done
+const INTERMISSION = 0.4;   // beat between generations
+
+const POP = 100;
+const ELITE = 6;
+const IMMIGRANT_RATE = 0.08;
+const MUT_RATE = 0.09;
+const MUT_SIGMA = 0.35;
+const CROSSOVER_RATE = 0.9;
+
+const N_IN = 11;
+const N_HID = 12;
+const N_OUT = 2;
+const GENOME_SIZE = (N_IN + 1) * N_HID + (N_HID + 1) * N_OUT;
+
+// ------------------------------------------------------------------- helpers
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a = (a + 0x6D2B79F5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+function gauss(rng) {
+  let u = 0, v = 0;
+  while (u === 0) u = rng();
+  while (v === 0) v = rng();
+  return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
+}
+function aabb(a, b) {
+  return a.x < b.x + b.w && a.x + a.w > b.x && a.y < b.y + b.h && a.y + a.h > b.y;
+}
+
+// -------------------------------------------------------------------- course
+// A fixed track: walls to clear, pits to jump, and a low tunnel you must run
+// through on the ground. The tunnel is what makes the task interesting — it
+// punishes "hold right and jump forever", which would otherwise solve the course.
+const PITS = [[8, 10], [24, 27], [31, 33]];
+const WALLS = [[4, 2], [12, 3], [23, 2], [29, 3]];
+const CEILINGS = [[14, 20]];         // tile span of the low tunnel
+const TUNNEL_CLEARANCE = 72;        // pixels of head room under the tunnel
+const FINISH_TILE = 35;
+const COURSE_TILES = 38;
+
+function buildCourse() {
+  const segments = [];
+  let start = 0;
+  for (const [a, b] of PITS) {
+    if (a > start) segments.push([start, a]);
+    start = b;
+  }
+  if (start < COURSE_TILES) segments.push([start, COURSE_TILES]);
+
+  const rects = [];
+  for (const [a, b] of segments) {
+    rects.push({ x: a * TILE, y: GROUND_Y, w: (b - a) * TILE, h: H - GROUND_Y, kind: 'ground' });
+  }
+  for (const [x, h] of WALLS) {
+    rects.push({ x: x * TILE, y: GROUND_Y - h * TILE, w: TILE, h: h * TILE, kind: 'wall' });
+  }
+  const ceilings = CEILINGS.map(([a, b]) => ({
+    x: a * TILE,
+    y: -400,                                  // reaches off-screen: no roof to land on
+    w: (b - a) * TILE,
+    h: 400 + GROUND_Y - TUNNEL_CLEARANCE
+  }));
+  for (const c of ceilings) {
+    rects.push({ x: c.x, y: c.y, w: c.w, h: c.h, kind: 'ceiling' });
+  }
+
+  return {
+    rects,
+    ceilings,
+    segments: segments.map(([a, b]) => ({ x: a * TILE, w: (b - a) * TILE })),
+    pits: PITS.map(([a, b]) => ({ x: a * TILE, w: (b - a) * TILE })),
+    walls: WALLS.map(([x, h]) => ({ x: x * TILE, w: TILE, h: h * TILE })),
+    finish: FINISH_TILE * TILE,
+    width: COURSE_TILES * TILE,
+    startX: 44
+  };
+}
+
+// --------------------------------------------------------------------- brain
+const _hid = new Float32Array(N_HID);
+const _out = new Float32Array(N_OUT);
+
+class Brain {
+  constructor(genome) { this.genome = genome; }
+
+  forward(inp) {
+    const g = this.genome;
+    let i = 0;
+    for (let j = 0; j < N_HID; j++) {
+      let s = g[i++];
+      for (let k = 0; k < N_IN; k++) s += g[i++] * inp[k];
+      _hid[j] = Math.tanh(s);
+    }
+    for (let j = 0; j < N_OUT; j++) {
+      let s = g[i++];
+      for (let k = 0; k < N_HID; k++) s += g[i++] * _hid[k];
+      _out[j] = Math.tanh(s);
+    }
+    return _out;
+  }
+}
+
+function randomGenome(rng) {
+  const g = new Float32Array(GENOME_SIZE);
+  for (let i = 0; i < GENOME_SIZE; i++) g[i] = gauss(rng) * 0.9;
+  return g;
+}
+
+function crossover(a, b, rng) {
+  if (rng() > CROSSOVER_RATE) return a.slice();
+  const g = new Float32Array(GENOME_SIZE);
+  for (let i = 0; i < GENOME_SIZE; i++) g[i] = rng() < 0.5 ? a[i] : b[i];
+  return g;
+}
+
+function mutate(g, rng) {
+  for (let i = 0; i < GENOME_SIZE; i++) {
+    if (rng() < MUT_RATE) g[i] += gauss(rng) * MUT_SIGMA;
+    if (rng() < 0.007) g[i] = gauss(rng) * 1.2; // occasional hard reset of a gene
+  }
+  return g;
+}
+
+// --------------------------------------------------------------------- agent
+class Agent {
+  constructor(genome, index) {
+    this.genome = genome;
+    this.brain = new Brain(genome);
+    this.index = index;
+    this.trail = [];
+    this.reset();
+  }
+
+  reset() {
+    this.x = 44;
+    this.y = GROUND_Y - AGENT_SIZE;
+    this.w = AGENT_SIZE;
+    this.h = AGENT_SIZE;
+    this.vx = 0;
+    this.vy = 0;
+    this.onGround = true;
+    this.done = false;
+    this.finished = false;
+    this.stuck = 0;
+    this.checkX = this.x;
+    this.checkT = 0;
+    this.fitness = 0;
+    this.best = 0;
+    this.jumps = 0;
+    this.trail.length = 0;
+    this.jumpFlash = 0;
+    this.stun = 0;
+    this.solvedAt = 0;
+  }
+
+  sense(course) {
+    const ax = this.x;
+    let dw = 900, wh = 0;
+    for (const w of course.walls) {
+      const d = w.x - ax;
+      if (w.x + w.w > ax && d < dw) { dw = d; wh = w.h; }
+    }
+    let dp = 900, pw = 0;
+    for (const p of course.pits) {
+      const d = p.x - ax;
+      if (p.x + p.w > ax && d < dp) { dp = d; pw = p.w; }
+    }
+    let dc = 900, under = 0;
+    for (const c of course.ceilings) {
+      if (this.x + this.w > c.x && this.x < c.x + c.w) under = 1;
+      const d = c.x - ax;
+      if (c.x + c.w > ax && d < dc) dc = d;
+    }
+    return [
+      1,
+      this.vx / MAX_SPEED,
+      this.vy / 900,
+      this.onGround ? 1 : -1,
+      clamp(dw / 420, -1, 1),
+      wh / 96,
+      clamp(dp / 420, -1, 1),
+      pw / 96,
+      clamp(dc / 420, -1, 1),
+      under,
+      (GROUND_Y - (this.y + AGENT_R)) / 200
+    ];
+  }
+
+  step(dt, course) {
+    const out = this.brain.forward(this.sense(course));
+
+    if (this.stun > 0) {
+      // still dazed from clonking the tunnel roof: no control input gets through
+      this.stun -= dt;
+      this.vx *= 0.86;
+    } else {
+      const target = out[0] * MAX_SPEED;
+      this.vx += clamp(target - this.vx, -ACCEL * dt, ACCEL * dt);
+
+      if (this.onGround && out[1] > 0.3) {
+        this.vy = -JUMP_V;
+        this.onGround = false;
+        this.jumps++;
+        this.jumpFlash = 0.18;
+      }
+    }
+
+    if (this.jumpFlash > 0) this.jumpFlash -= dt;
+
+    this.vy = Math.min(this.vy + GRAVITY * dt, 1500);
+
+    // horizontal: resolve only when the overlap is genuinely a side hit.
+    // (Resolving against the floor used to shove agents across whole segments.)
+    this.x += this.vx * dt;
+    for (const r of course.rects) {
+      if (!aabb(this, r)) continue;
+      const oy = Math.min(this.y + this.h, r.y + r.h) - Math.max(this.y, r.y);
+      const ox = Math.min(this.x + this.w, r.x + r.w) - Math.max(this.x, r.x);
+      if (oy <= ox) continue;
+      if (this.vx > 0) this.x = r.x - this.w;
+      else if (this.vx < 0) this.x = r.x + r.w;
+      this.vx = 0;
+    }
+
+    // vertical
+    this.y += this.vy * dt;
+    this.onGround = false;
+    for (const r of course.rects) {
+      if (!aabb(this, r)) continue;
+      const oy = Math.min(this.y + this.h, r.y + r.h) - Math.max(this.y, r.y);
+      const ox = Math.min(this.x + this.w, r.x + r.w) - Math.max(this.x, r.x);
+      if (ox <= oy) continue;
+      if (this.vy > 0) { this.y = r.y - this.h; this.vy = 0; this.onGround = true; }
+      else if (this.vy < 0) {
+        this.y = r.y + r.h;
+        this.vy = 0;
+        if (r.kind === 'ceiling') { this.stun = 0.35; this.vx *= 0.2; } // clonk
+      }
+    }
+
+    if (this.x > this.best) this.best = this.x;
+
+    // trail for the current leader
+    this.trail.push({ x: this.x, y: this.y });
+    if (this.trail.length > 26) this.trail.shift();
+  }
+
+  checkDone(sim, dt) {
+    if (this.x + this.w >= sim.course.finish) {
+      this.done = true;
+      this.finished = true;
+      this.solvedAt = sim.elapsed;
+      return;
+    }
+    if (this.y > H + 80) { this.done = true; return; }
+
+    this.checkT += dt;
+    if (this.checkT >= 0.5) {
+      if (this.x - this.checkX < 4) this.stuck += this.checkT;
+      else this.stuck = 0;
+      this.checkX = this.x;
+      this.checkT = 0;
+      if (this.stuck >= STUCK_TIME) this.done = true;
+    }
+  }
+
+  score(course) {
+    let f = this.best;
+    if (this.finished) f += 400 + Math.max(0, TIME_LIMIT - this.solvedAt) * 30;
+    return f;
+  }
+}
+
+// ----------------------------------------------------------------------- sim
+class Sim {
+  constructor(seed) {
+    this.course = buildCourse();
+    this.seed = (seed >>> 0) || 1;
+    this.newRun(this.seed);
+  }
+
+  newRun(seed) {
+    this.seed = (seed >>> 0) || 1;
+    this.rng = mulberry32(this.seed);
+    this.generation = 1;
+    this.history = [];
+    this.bestEver = 0;
+    this.bestEverGenome = null;
+    this.solvedGen = 0;
+    this.pop = [];
+    for (let i = 0; i < POP; i++) this.pop.push(new Agent(randomGenome(this.rng), i));
+    this.startGeneration();
+  }
+
+  startGeneration() {
+    for (const a of this.pop) a.reset();
+    this.elapsed = 0;
+    this.genDone = false;
+    this.interT = 0;
+    this.genBest = 0;
+    this.genAvg = 0;
+  }
+
+  step(dt) {
+    if (this.genDone) {
+      this.interT += dt;
+      if (this.interT >= INTERMISSION) {
+        this.evolve();
+        this.startGeneration();
+      }
+      return;
+    }
+
+    this.elapsed += dt;
+    let active = 0;
+    for (const a of this.pop) {
+      if (a.done) continue;
+      a.step(dt, this.course);
+      a.checkDone(this, dt);
+      if (!a.done) active++;
+    }
+    if (active === 0 || this.elapsed >= TIME_LIMIT) this.endGeneration();
+  }
+
+  endGeneration() {
+    let best = 0, sum = 0, alive = 0, finished = 0;
+    for (const a of this.pop) {
+      a.fitness = a.score(this.course);
+      if (a.fitness > best) best = a.fitness;
+      sum += a.fitness;
+      if (!a.done) alive++;
+      if (a.finished) finished++;
+    }
+    this.genBest = best;
+    this.genAvg = sum / POP;
+    this.alive = alive;
+    this.finished = finished;
+
+    if (best > this.bestEver) {
+      this.bestEver = best;
+      const champ = this.pop.reduce((m, a) => (a.fitness > m.fitness ? a : m), this.pop[0]);
+      this.bestEverGenome = champ.genome.slice();
+      if (!this.solvedGen && champ.finished) this.solvedGen = this.generation;
+    }
+    if (!this.solvedGen) {
+      const champ = this.pop.find(a => a.finished);
+      if (champ) this.solvedGen = this.generation;
+    }
+
+    this.history.push({ gen: this.generation, best: this.genBest, avg: this.genAvg, fin: finished / POP });
+    if (this.history.length > 400) this.history.shift();
+
+    this.genDone = true;
+    this.interT = 0;
+    this.pop.sort((a, b) => b.fitness - a.fitness);
+  }
+
+  evolve() {
+    const sorted = this.pop;
+    const next = [];
+    for (let i = 0; i < ELITE; i++) next.push(sorted[i].genome.slice());
+
+    const pick = () => {
+      let best = null;
+      for (let i = 0; i < 4; i++) {
+        const c = sorted[(this.rng() * POP) | 0];
+        if (!best || c.fitness > best.fitness) best = c;
+      }
+      return best;
+    };
+
+    while (next.length < POP) {
+      if (this.rng() < IMMIGRANT_RATE) {
+        next.push(randomGenome(this.rng));
+      } else {
+        const a = pick();
+        const b = pick();
+        const child = mutate(crossover(a.genome, b.genome, this.rng), this.rng);
+        next.push(child);
+      }
+    }
+
+    this.pop = next.map((g, i) => new Agent(g, i));
+    this.generation++;
+  }
+
+  leader() {
+    let best = null;
+    for (const a of this.pop) {
+      if (!best) { best = a; continue; }
+      if (a.x > best.x) best = a;
+    }
+    return best;
+  }
+}
+
+// ------------------------------------------------------------------ palette
+const COL = {
+  void0: '#0a1120',
+  grid: 'rgba(120, 160, 255, 0.07)',
+  ground: '#121c30',
+  groundLine: '#c4f24a',
+  wall: '#1a2740',
+  wallTop: '#2f4468',
+  wallEdge: 'rgba(120, 160, 240, 0.32)',
+  agent: '#4f7dff',
+  agentBest: '#c4f24a',
+  dead: '#2a3550',
+  text: '#dfe8ff',
+  dim: 'rgba(160, 180, 220, 0.5)',
+  accent: '#c4f24a',
+  ion: '#6aa8ff',
+  panel: 'rgba(7, 12, 24, 0.72)',
+  panelEdge: 'rgba(110, 145, 215, 0.22)'
+};
+
+function rr(ctx, x, y, w, h, r) {
+  const rad = Math.max(0, Math.min(r, w / 2, h / 2));
+  ctx.beginPath();
+  ctx.moveTo(x + rad, y);
+  ctx.arcTo(x + w, y, x + w, y + h, rad);
+  ctx.arcTo(x + w, y + h, x, y + h, rad);
+  ctx.arcTo(x, y + h, x, y, rad);
+  ctx.arcTo(x, y, x + w, y, rad);
+  ctx.closePath();
+}
+
+function text(ctx, s, x, y, size, color, align, weight) {
+  ctx.font = (weight || 600) + ' ' + size + 'px ui-monospace, SFMono-Regular, Menlo, Consolas, monospace';
+  ctx.textAlign = align || 'left';
+  ctx.textBaseline = 'alphabetic';
+  ctx.fillStyle = color;
+  ctx.fillText(s, x, y);
+}
+
+// ------------------------------------------------------------------ renderer
+class Renderer {
+  constructor(ctx, sim) {
+    this.ctx = ctx;
+    this.sim = sim;
+    this.t = 0;
+  }
+
+  draw() {
+    const ctx = this.ctx;
+    const sim = this.sim;
+    this.t += 0.016;
+
+    this.background(ctx);
+    this.course(ctx, sim.course);
+    this.agents(ctx, sim);
+    this.hud(ctx, sim);
+    this.chart(ctx, sim);
+    if (sim.genDone) this.intermission(ctx, sim);
+  }
+
+  background(ctx) {
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#0b1428');
+    g.addColorStop(0.55, '#080e1c');
+    g.addColorStop(1, '#05080f');
+    ctx.fillStyle = g;
+    ctx.fillRect(0, 0, W, H);
+
+    // soft glow where the finish line lives
+    const fg = ctx.createRadialGradient(this.sim.course.finish, GROUND_Y - 120, 10, this.sim.course.finish, GROUND_Y - 120, 300);
+    fg.addColorStop(0, 'rgba(196, 242, 74, 0.10)');
+    fg.addColorStop(1, 'rgba(196, 242, 74, 0)');
+    ctx.fillStyle = fg;
+    ctx.fillRect(0, 0, W, H);
+
+    // haze rising off the floor
+    const haze = ctx.createLinearGradient(0, GROUND_Y - 210, 0, GROUND_Y);
+    haze.addColorStop(0, 'rgba(90, 130, 220, 0)');
+    haze.addColorStop(1, 'rgba(90, 130, 220, 0.06)');
+    ctx.fillStyle = haze;
+    ctx.fillRect(0, GROUND_Y - 210, W, 210);
+
+    // measurement grid
+    ctx.strokeStyle = COL.grid;
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    for (let x = 0; x <= W; x += 60) { ctx.moveTo(x + 0.5, 90); ctx.lineTo(x + 0.5, H); }
+    for (let y = 150; y <= H; y += 60) { ctx.moveTo(0, y + 0.5); ctx.lineTo(W, y + 0.5); }
+    ctx.stroke();
+
+    // vignette
+    const vig = ctx.createRadialGradient(W / 2, H * 0.45, H * 0.25, W / 2, H * 0.45, W * 0.78);
+    vig.addColorStop(0, 'rgba(0,0,0,0)');
+    vig.addColorStop(1, 'rgba(0,0,0,0.26)');
+    ctx.fillStyle = vig;
+    ctx.fillRect(0, 0, W, H);
+  }
+
+  course(ctx, course) {
+    // void under the floor so pits read as holes
+    const vg = ctx.createLinearGradient(0, GROUND_Y, 0, H);
+    vg.addColorStop(0, '#05070e');
+    vg.addColorStop(1, '#020306');
+    ctx.fillStyle = vg;
+    ctx.fillRect(0, GROUND_Y, W, H - GROUND_Y);
+
+    for (const s of course.segments) {
+      ctx.fillStyle = COL.ground;
+      ctx.fillRect(s.x, GROUND_Y, s.w, H - GROUND_Y);
+      // strata so the floor reads as a solid mass, not a floating box
+      ctx.fillStyle = 'rgba(255,255,255,0.035)';
+      for (let sx = s.x + 10; sx < s.x + s.w; sx += 46) {
+        ctx.fillRect(sx, GROUND_Y + 18, 26, 2);
+        ctx.fillRect(sx + 14, GROUND_Y + 40, 26, 2);
+      }
+      ctx.fillStyle = COL.groundLine;
+      ctx.fillRect(s.x, GROUND_Y, s.w, 3);
+      ctx.fillStyle = 'rgba(196, 242, 74, 0.16)';
+      ctx.fillRect(s.x, GROUND_Y + 3, s.w, 8);
+      ctx.fillStyle = 'rgba(0,0,0,0.35)';
+      ctx.fillRect(s.x, GROUND_Y, 2, H - GROUND_Y);
+      ctx.fillRect(s.x + s.w - 2, GROUND_Y, 2, H - GROUND_Y);
+    }
+
+    for (const w of course.walls) {
+      ctx.fillStyle = COL.wall;
+      rr(ctx, w.x + 1, w.y, w.w - 2, w.h, 4);
+      ctx.fill();
+      ctx.strokeStyle = COL.wallEdge;
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.fillStyle = COL.groundLine;
+      ctx.fillRect(w.x + 3, w.y, w.w - 6, 3);
+      ctx.fillStyle = COL.wallTop;
+      ctx.fillRect(w.x + 3, w.y + 3, w.w - 6, 3);
+    }
+
+    for (const c of course.ceilings) {
+      // solid slab hanging over the run
+      ctx.fillStyle = '#131d33';
+      ctx.fillRect(c.x, 0, c.w, c.y + c.h);
+      ctx.fillStyle = 'rgba(255,255,255,0.04)';
+      for (let sx = c.x + 8; sx < c.x + c.w; sx += 40) ctx.fillRect(sx, 20, 22, 2);
+      ctx.fillStyle = COL.groundLine;
+      ctx.fillRect(c.x, c.y + c.h - 3, c.w, 3);
+      ctx.fillStyle = 'rgba(196, 242, 74, 0.14)';
+      ctx.fillRect(c.x, c.y + c.h - 11, c.w, 8);
+      ctx.fillStyle = 'rgba(0,0,0,0.45)';
+      ctx.fillRect(c.x + c.w - 2, 0, 2, c.y + c.h);
+      ctx.fillRect(c.x, 0, 2, c.y + c.h);
+      text(ctx, 'LOW CLEARANCE', c.x + c.w / 2, c.y + c.h - 18, 11, 'rgba(160,180,220,0.55)', 'center', 600);
+    }
+
+    // finish
+    const flagTop = GROUND_Y - 210;
+    ctx.save();
+    ctx.setLineDash([7, 7]);
+    ctx.strokeStyle = 'rgba(196, 242, 74, 0.6)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(course.finish, flagTop);
+    ctx.lineTo(course.finish, GROUND_Y);
+    ctx.stroke();
+    ctx.restore();
+
+    ctx.fillStyle = COL.accent;
+    ctx.beginPath();
+    ctx.moveTo(course.finish, flagTop);
+    ctx.lineTo(course.finish + 42, flagTop + 12);
+    ctx.lineTo(course.finish, flagTop + 24);
+    ctx.closePath();
+    ctx.fill();
+    text(ctx, 'FINISH', course.finish - 8, flagTop + 26, 12, 'rgba(196,242,74,0.8)', 'right');
+  }
+
+  agents(ctx, sim) {
+    const leader = sim.leader();
+    const leaderId = leader ? leader.index : -1;
+
+    for (const a of sim.pop) {
+      const isLeader = a.index === leaderId && !a.done;
+      if (a.done && !a.finished) {
+        ctx.globalAlpha = 0.14;
+      } else if (a.done && a.finished) {
+        ctx.globalAlpha = 0.85;
+      } else if (isLeader) {
+        ctx.globalAlpha = 1;
+      } else {
+        ctx.globalAlpha = 0.42;
+      }
+
+      if (isLeader) {
+        // trail
+        for (let i = 0; i < a.trail.length; i++) {
+          const p = a.trail[i];
+          const k = i / a.trail.length;
+          ctx.globalAlpha = 0.05 + k * 0.16;
+          ctx.fillStyle = COL.accent;
+          ctx.beginPath();
+          ctx.arc(p.x + AGENT_R, p.y + AGENT_R, 2 + k * 4, 0, 6.2832);
+          ctx.fill();
+        }
+        ctx.globalAlpha = 1;
+      }
+
+      const cx = a.x + AGENT_R;
+      const cy = a.y + AGENT_R;
+
+      if (isLeader) {
+        ctx.shadowColor = 'rgba(196,242,74,0.85)';
+        ctx.shadowBlur = 22;
+      }
+      ctx.beginPath();
+      ctx.arc(cx, cy, AGENT_R, 0, 6.2832);
+      ctx.fillStyle = a.done && !a.finished ? COL.dead
+        : a.finished ? COL.accent
+        : isLeader ? COL.agentBest : COL.agent;
+      ctx.fill();
+      ctx.shadowBlur = 0;
+      ctx.shadowColor = 'transparent';
+
+      // eyes look the way they're going
+      const dir = a.vx < -8 ? -1 : 1;
+      ctx.fillStyle = 'rgba(6, 10, 20, 0.85)';
+      ctx.beginPath();
+      ctx.arc(cx + dir * 5 - 3, cy - 3, 2.4, 0, 6.2832);
+      ctx.arc(cx + dir * 5 + 3, cy - 3, 2.4, 0, 6.2832);
+      ctx.fill();
+
+      if (isLeader) {
+        ctx.strokeStyle = 'rgba(255,255,255,0.85)';
+        ctx.lineWidth = 1.5;
+        ctx.beginPath();
+        ctx.arc(cx, cy, AGENT_R + 4, 0, 6.2832);
+        ctx.stroke();
+      }
+    }
+    ctx.globalAlpha = 1;
+  }
+
+  hud(ctx, sim) {
+    text(ctx, 'NEURO', 34, 52, 22, COL.accent, 'left', 700);
+    text(ctx, 'neuroevolution lab', 34, 72, 12, COL.dim, 'left', 500);
+
+    const solved = sim.bestEver >= sim.course.finish;
+    const done = sim.pop.filter(a => a.finished).length;
+    const items = [
+      ['GEN', String(sim.generation).padStart(3, '0')],
+      ['BEST', String(Math.min(Math.round(Math.max(sim.bestEver, sim.leader() ? sim.leader().best : 0)), sim.course.finish))],
+      ['FINISHED', done + '/' + POP]
+    ];
+    let x = 34;
+    for (const [k, v] of items) {
+      text(ctx, k, x, 112, 11, COL.dim, 'left', 500);
+      text(ctx, v, x, 134, 20, COL.text, 'left', 700);
+      x += 118;
+    }
+
+    if (solved) {
+      const label = 'SOLVED  ·  GEN ' + sim.solvedGen;
+      ctx.font = '700 12px ui-monospace, Menlo, monospace';
+      const w = ctx.measureText(label).width + 24;
+      ctx.fillStyle = 'rgba(196,242,74,0.14)';
+      rr(ctx, 34, 150, w, 26, 13);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(196,242,74,0.55)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+      text(ctx, label, 46, 168, 12, COL.accent, 'left', 700);
+    }
+  }
+
+  chart(ctx, sim) {
+    const w = 306, h = 140, x = W - w - 34, y = 30;
+    ctx.fillStyle = COL.panel;
+    rr(ctx, x, y, w, h, 10);
+    ctx.fill();
+    ctx.strokeStyle = COL.panelEdge;
+    ctx.lineWidth = 1;
+    ctx.stroke();
+
+    const px = x + 12, py = y + 30, pw = w - 24, ph = h - 46;
+    text(ctx, 'DISTANCE PER GENERATION', x + 12, y + 20, 10, COL.dim, 'left', 600);
+
+    // solved line
+    ctx.save();
+    ctx.setLineDash([4, 4]);
+    ctx.strokeStyle = 'rgba(196,242,74,0.35)';
+    ctx.beginPath();
+    ctx.moveTo(px, py + 2);
+    ctx.lineTo(px + pw, py + 2);
+    ctx.stroke();
+    ctx.restore();
+
+    const hist = sim.history.slice(-120);
+    if (hist.length > 1) {
+      const n = hist.length;
+      const gx = i => px + (i / (n - 1)) * pw;
+      const gy = v => py + ph - clamp(v / sim.course.finish, 0, 1) * ph;
+
+      // share of the population that finished (0..1 shares the same 0..100% axis)
+      ctx.save();
+      ctx.setLineDash([3, 3]);
+      ctx.beginPath();
+      hist.forEach((d, i) => (i ? ctx.lineTo(gx(i), gy(d.fin * sim.course.finish)) : ctx.moveTo(gx(i), gy(d.fin * sim.course.finish))));
+      ctx.strokeStyle = 'rgba(186, 140, 255, 0.75)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+
+      // average
+      ctx.beginPath();
+      hist.forEach((d, i) => (i ? ctx.lineTo(gx(i), gy(d.avg)) : ctx.moveTo(gx(i), gy(d.avg))));
+      ctx.strokeStyle = 'rgba(106, 168, 255, 0.55)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // best
+      ctx.beginPath();
+      hist.forEach((d, i) => (i ? ctx.lineTo(gx(i), gy(d.best)) : ctx.moveTo(gx(i), gy(d.best))));
+      ctx.strokeStyle = COL.accent;
+      ctx.lineWidth = 2;
+      ctx.stroke();
+
+      const last = hist[n - 1];
+      ctx.fillStyle = COL.accent;
+      ctx.beginPath();
+      ctx.arc(gx(n - 1), gy(last.best), 3, 0, 6.2832);
+      ctx.fill();
+    }
+
+    text(ctx, '100%', px + pw, py + 12, 9, 'rgba(196,242,74,0.55)', 'right', 500);
+    text(ctx, '0', px, py + ph + 12, 9, COL.dim, 'left', 500);
+    text(ctx, String(sim.generation), px + pw, py + ph + 12, 9, COL.dim, 'right', 500);
+
+    // legend
+    const lx = x + 12, ly = y + h - 6;
+    ctx.fillStyle = COL.accent; ctx.fillRect(lx, ly - 5, 9, 2);
+    text(ctx, 'best', lx + 14, ly, 9, COL.dim, 'left', 500);
+    ctx.fillStyle = 'rgba(106,168,255,0.7)'; ctx.fillRect(lx + 52, ly - 5, 9, 2);
+    text(ctx, 'avg', lx + 66, ly, 9, COL.dim, 'left', 500);
+    ctx.fillStyle = 'rgba(186,140,255,0.8)'; ctx.fillRect(lx + 100, ly - 5, 9, 2);
+    text(ctx, 'finish rate', lx + 114, ly, 9, COL.dim, 'left', 500);
+  }
+
+  intermission(ctx, sim) {
+    const a = 1 - clamp(sim.interT / INTERMISSION, 0, 1);
+    ctx.globalAlpha = a * 0.9;
+    ctx.fillStyle = 'rgba(6, 10, 20, 0.55)';
+    ctx.fillRect(0, H / 2 - 86, W, 92);
+    text(ctx, 'GENERATION ' + sim.generation + ' COMPLETE', W / 2, H / 2 - 48, 20, COL.accent, 'center', 700);
+    text(ctx, 'best ' + Math.round(sim.genBest) + '   average ' + Math.round(sim.genAvg) + '   finished ' + (sim.finished || 0),
+      W / 2, H / 2 - 22, 13, COL.text, 'center', 500);
+    ctx.globalAlpha = 1;
+  }
+}
+
+// ----------------------------------------------------------------------- app
+class App {
+  constructor(canvas, sim) {
+    this.canvas = canvas;
+    this.sim = sim;
+    this.renderer = new Renderer(canvas.getContext('2d'), sim);
+    this.speed = 4;
+    this.paused = false;
+    this.last = 0;
+    this.acc = 0;
+    this.tick = this.tick.bind(this);
+  }
+
+  start() {
+    this.last = performance.now();
+    requestAnimationFrame(this.tick);
+  }
+
+  setSpeed(n) {
+    this.speed = n;
+    document.querySelectorAll('#bar button').forEach(b => b.classList.remove('on'));
+    const el = document.getElementById(n === 1 ? 'b1' : n === 4 ? 'b4' : 'b16');
+    if (el) el.classList.add('on');
+  }
+
+  togglePause() {
+    this.paused = !this.paused;
+    const b = document.getElementById('bPause');
+    if (b) { b.textContent = this.paused ? 'Resume' : 'Pause'; b.classList.toggle('on', this.paused); }
+  }
+
+  newRun() {
+    const seed = (Math.random() * 1e9) | 0;
+    this.sim.newRun(seed);
+    try { history.replaceState(null, '', '?seed=' + seed); } catch (e) { /* ignore */ }
+  }
+
+  tick(now) {
+    requestAnimationFrame(this.tick);
+    let dt = (now - this.last) / 1000;
+    this.last = now;
+    if (!(dt > 0)) dt = 1 / 60;
+    if (dt > 0.1) dt = 0.1;
+
+    if (!this.paused) {
+      for (let i = 0; i < this.speed; i++) this.sim.step(1 / 60);
+    }
+    this.renderer.t += dt;
+    this.renderer.draw();
+  }
+}
+
+// ---------------------------------------------------------------------- boot
+window.__NEURO__ = {
+  Sim, Agent, Brain, buildCourse,
+  GENOME_SIZE, N_IN, N_HID, N_OUT, POP, TIME_LIMIT, COURSE_TILES, FINISH_TILE, W, H, GROUND_Y
+};
+
+if (!window.__NEURO_HEADLESS__) {
+  const seedParam = parseInt(new URLSearchParams(location.search).get('seed'), 10);
+  const seed = seedParam > 0 ? seedParam : (Math.random() * 1e9) | 0;
+
+  const sim = new Sim(seed);
+  const app = new App(document.getElementById('c'), sim);
+
+  document.getElementById('bPause').addEventListener('click', () => app.togglePause());
+  document.getElementById('b1').addEventListener('click', () => app.setSpeed(1));
+  document.getElementById('b4').addEventListener('click', () => app.setSpeed(4));
+  document.getElementById('b16').addEventListener('click', () => app.setSpeed(16));
+  document.getElementById('bNew').addEventListener('click', () => app.newRun());
+
+  window.addEventListener('keydown', e => {
+    if (e.code === 'Space') { e.preventDefault(); app.togglePause(); }
+    else if (e.code === 'Digit1') app.setSpeed(1);
+    else if (e.code === 'Digit2') app.setSpeed(4);
+    else if (e.code === 'Digit3') app.setSpeed(16);
+    else if (e.code === 'KeyN') { if (!sim.genDone) sim.endGeneration(); }
+    else if (e.code === 'KeyR') app.newRun();
+  });
+
+  window.__NEURO__.sim = sim;
+  window.__NEURO__.app = app;
+  app.start();
+}
+
+})();
+</script>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
