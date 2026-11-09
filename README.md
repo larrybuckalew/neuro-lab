@@ -1,5 +1,9 @@
 # NEURO — watch a population learn
 
+[![tests](https://github.com/larrybuckalew/neuro-lab/actions/workflows/tests.yml/badge.svg)](https://github.com/larrybuckalew/neuro-lab/actions/workflows/tests.yml)
+
+**▶ [Watch it run](https://larrybuckalew.github.io/neuro-lab/)** — nothing to install.
+
 A neuroevolution lab in the browser. One hundred agents, each driven by its own
 tiny neural network, are dropped onto the same obstacle course. They start by
 falling over. Within a few generations one of them gets to the flag; within a few
@@ -8,7 +12,7 @@ dozen, most of them do.
 Nothing is scripted. There is no training data and no backpropagation — only a
 population, a fitness score, and selection.
 
-**Open `index.html`.** No build step, no dependencies, no API keys.
+You can also just open `index.html`. No build step, no dependencies, no API keys.
 
 ![NEURO running](shots/neuro.png)
 
