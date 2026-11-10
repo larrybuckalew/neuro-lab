@@ -61,8 +61,12 @@ replaced with fresh random genomes to keep the gene pool from stagnating.
 | `1` `2` `3` | 1× · 4× · 16× simulation speed |
 | `N` | skip to the end of this generation |
 | `R` | new run (new seed — a different learning path) |
+| `?` | bring back the explainer card |
 
 The seed lives in the URL (`?seed=12345`), so a run is reproducible and shareable.
+
+A short card explains the whole idea on first load, and holds the run at generation
+1 until you click. The **What is this?** button (or `?`) brings it back at any point.
 
 ## Why the course looks like that
 
