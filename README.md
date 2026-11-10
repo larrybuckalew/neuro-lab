@@ -31,6 +31,22 @@ height above the floor
 Those feed a 11 → 12 → 2 network (`tanh`), which outputs two continuous values:
 **how hard to run** and **whether to jump**. That's the whole creature.
 
+Four things on screen are worth knowing how to read:
+
+- **The gold dashed ring** is the record holder — the best genome so far — re-running
+  every generation as a ghost. It isn't in the population and can't be selected, so
+  there is always a visible answer to "what does a good run look like right now",
+  even in generation 3 while most of the field is still stuck at the first wall.
+- **Population mastery** is the number that matters. One creature clearing the course
+  is luck; the bar is the share of the population that finished the last generation,
+  and it climbing is the thing actually being demonstrated.
+- **The dashed gold line** in the world is the furthest anyone has ever got. It moves
+  right as the frontier moves, and it is the honest measure of progress when the
+  chart is still flat.
+- **The chart** tracks best distance, average distance, and finish rate. The average
+  line is the laggard — the one that shows the whole population improving rather than
+  one lucky mutant.
+
 Every generation is 10 seconds. When it ends, the 100 agents are ranked by how far
 they got (plus a bonus for finishing, and a bonus for finishing quickly). The top
 six survive untouched, the rest are bred from tournament-selected parents with
@@ -87,8 +103,10 @@ simulation with no renderer, and asserts the interesting things:
    generations.
 2. **Determinism** — the same seed reproduces the same run; different seeds
    diverge.
-3. **No NaN/Infinity** anywhere in agent state.
-4. **Throughput** — enough simulation steps per second to drive 16× rendering
+3. **The ghost stays a ghost** — it carries the record genome, and it is not in
+   the population, so it can never skew selection.
+4. **No NaN/Infinity** anywhere in agent state.
+5. **Throughput** — enough simulation steps per second to drive 16× rendering
    without dropping frames.
 
 ```sh
@@ -102,9 +120,9 @@ course was built around.
 
 ## Ideas
 
-Speciation with fitness sharing, novelty search, a second hidden layer, letting
-the course be procedurally generated per seed, saving and reloading champion
-genomes, or a "watch the champion" mode that replays the best run at 1×.
+Speciation with fitness sharing, novelty search, a second hidden layer, a
+procedurally generated course per seed, exporting and re-importing champion
+genomes, or a slow-motion replay of the best run at the end of every generation.
 
 ## License
 

@@ -394,8 +394,10 @@ class Sim {
     this.generation = 1;
     this.history = [];
     this.bestEver = 0;
+    this.bestDist = 0;
     this.bestEverGenome = null;
     this.solvedGen = 0;
+    this.ghost = null;
     this.pop = [];
     for (let i = 0; i < POP; i++) this.pop.push(new Agent(randomGenome(this.rng), i));
     this.startGeneration();
@@ -403,6 +405,10 @@ class Sim {
 
   startGeneration() {
     for (const a of this.pop) a.reset();
+    // the record holder re-runs every generation as a ghost, so there is always
+    // a visible answer to "what does a good run look like right now?"
+    this.ghost = this.bestEverGenome ? new Agent(this.bestEverGenome.slice(), -1) : null;
+    if (this.ghost) this.ghost.isGhost = true;
     this.elapsed = 0;
     this.genDone = false;
     this.interT = 0;
@@ -428,18 +434,24 @@ class Sim {
       a.checkDone(this, dt);
       if (!a.done) active++;
     }
+    if (this.ghost && !this.ghost.done) {
+      this.ghost.step(dt, this.course);
+      this.ghost.checkDone(this, dt);
+    }
     if (active === 0 || this.elapsed >= TIME_LIMIT) this.endGeneration();
   }
 
   endGeneration() {
-    let best = 0, sum = 0, alive = 0, finished = 0;
+    let best = 0, sum = 0, alive = 0, finished = 0, maxDist = 0;
     for (const a of this.pop) {
       a.fitness = a.score(this.course);
       if (a.fitness > best) best = a.fitness;
+      if (a.best > maxDist) maxDist = a.best;
       sum += a.fitness;
       if (!a.done) alive++;
       if (a.finished) finished++;
     }
+    if (maxDist > this.bestDist) this.bestDist = maxDist;
     this.genBest = best;
     this.genAvg = sum / POP;
     this.alive = alive;
@@ -557,10 +569,26 @@ class Renderer {
 
     this.background(ctx);
     this.course(ctx, sim.course);
+    this.recordLine(ctx, sim);
     this.agents(ctx, sim);
     this.hud(ctx, sim);
     this.chart(ctx, sim);
     if (sim.genDone) this.intermission(ctx, sim);
+  }
+
+  recordLine(ctx, sim) {
+    const x = Math.max(sim.bestDist, sim.leader() ? sim.leader().best : 0);
+    if (x < 90) return;
+    ctx.save();
+    ctx.setLineDash([2, 7]);
+    ctx.strokeStyle = 'rgba(255, 214, 102, 0.38)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(x, GROUND_Y - 168);
+    ctx.lineTo(x, GROUND_Y);
+    ctx.stroke();
+    ctx.restore();
+    text(ctx, 'RECORD ' + Math.round(x), x + 7, GROUND_Y - 172, 10, 'rgba(255,214,102,0.62)', 'left', 600);
   }
 
   background(ctx) {
@@ -682,6 +710,29 @@ class Renderer {
     const leader = sim.leader();
     const leaderId = leader ? leader.index : -1;
 
+    // the record holder, ghosted in gold
+    const g = sim.ghost;
+    if (g) {
+      const gx = g.x + AGENT_R, gy = g.y + AGENT_R;
+      ctx.save();
+      ctx.setLineDash([4, 3]);
+      ctx.strokeStyle = g.finished ? 'rgba(255, 214, 102, 0.95)' : 'rgba(255, 214, 102, 0.7)';
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(gx, gy, AGENT_R + 3.5, 0, 6.2832);
+      ctx.stroke();
+      ctx.setLineDash([]);
+      ctx.fillStyle = 'rgba(255, 214, 102, 0.14)';
+      ctx.beginPath();
+      ctx.arc(gx, gy, AGENT_R, 0, 6.2832);
+      ctx.fill();
+      ctx.fillStyle = 'rgba(255, 214, 102, 0.9)';
+      ctx.beginPath();
+      ctx.arc(gx, gy, 3, 0, 6.2832);
+      ctx.fill();
+      ctx.restore();
+    }
+
     for (const a of sim.pop) {
       const isLeader = a.index === leaderId && !a.done;
       if (a.done && !a.finished) {
@@ -761,18 +812,36 @@ class Renderer {
       x += 118;
     }
 
-    if (solved) {
-      const label = 'SOLVED  ·  GEN ' + sim.solvedGen;
-      ctx.font = '700 12px ui-monospace, Menlo, monospace';
-      const w = ctx.measureText(label).width + 24;
-      ctx.fillStyle = 'rgba(196,242,74,0.14)';
-      rr(ctx, 34, 150, w, 26, 13);
+    // mastery is the real milestone: one lucky run is not the story, the
+    // population learning to do it reliably is.
+    const last = sim.history.length ? sim.history[sim.history.length - 1] : null;
+    const rate = last ? last.fin : 0;
+    const bw = 232, bx = 34, by = 160;
+    text(ctx, solved ? 'POPULATION MASTERY' : 'NOBODY HAS FINISHED YET', bx, by - 8, 10, COL.dim, 'left', 600);
+    ctx.fillStyle = 'rgba(196, 242, 74, 0.10)';
+    rr(ctx, bx, by, bw, 9, 4.5);
+    ctx.fill();
+    if (rate > 0) {
+      ctx.fillStyle = COL.accent;
+      rr(ctx, bx, by, Math.max(3, bw * rate), 9, 4.5);
       ctx.fill();
-      ctx.strokeStyle = 'rgba(196,242,74,0.55)';
-      ctx.lineWidth = 1;
-      ctx.stroke();
-      text(ctx, label, 46, 168, 12, COL.accent, 'left', 700);
     }
+    text(ctx, Math.round(rate * 100) + '%', bx + bw + 10, by + 9, 12, COL.text, 'left', 700);
+
+    if (solved) {
+      text(ctx, 'first solve · gen ' + sim.solvedGen, bx, by + 30, 10, 'rgba(196,242,74,0.6)', 'left', 600);
+    }
+
+    // legend for the gold ghost
+    ctx.save();
+    ctx.setLineDash([3, 2]);
+    ctx.strokeStyle = 'rgba(255, 214, 102, 0.8)';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    ctx.arc(bx + 6, by + 48, 6, 0, 6.2832);
+    ctx.stroke();
+    ctx.restore();
+    text(ctx, 'record holder', bx + 18, by + 52, 10, COL.dim, 'left', 500);
   }
 
   chart(ctx, sim) {
@@ -949,6 +1018,12 @@ if (!window.__NEURO_HEADLESS__) {
 </script>
 </body>
 </html>
+
+
+
+
+
+
 
 
 

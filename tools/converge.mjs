@@ -102,6 +102,18 @@ if (Math.abs(a1.bestEver - a2.bestEver) < 0.001 && a1.generation === a2.generati
   fail(`non-deterministic: ${a1.bestEver} vs ${a2.bestEver}`);
 }
 
+// the record-holder ghost must exist, track the champion, and stay out of the
+// population (so it can't skew selection)
+if (a1.ghost && a1.bestEverGenome) {
+  const same = a1.ghost.genome.length === a1.bestEverGenome.length &&
+    a1.ghost.genome.every((v, i) => v === a1.bestEverGenome[i]);
+  const outside = !a1.pop.includes(a1.ghost);
+  if (same && outside && a1.ghost.isGhost) ok('record holder runs as a ghost, outside the population');
+  else fail(`ghost wired wrong (sameGenome=${same}, outside=${outside}, isGhost=${a1.ghost.isGhost})`);
+} else {
+  fail('no ghost after 25 generations');
+}
+
 // different seeds should not collapse to identical results
 const b1 = new Sim(1);
 const b2 = new Sim(999999);
